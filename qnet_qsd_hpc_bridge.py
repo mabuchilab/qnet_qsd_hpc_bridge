@@ -38,7 +38,7 @@ def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
     """Create a map function suitable to be passed to
     :meth:`qnet.misc.qsd_codegen.run_delayed`
     """
-    def clusterjob_map(qsd_run_worker, list_of_kwargs)
+    def clusterjob_map(qsd_run_worker, list_of_kwargs):
         job = clusterjob.JobScript(body, jobname='qnet_qsd')
         job.read_settings(inifile)
         job.resources['nodes'] = nodes
@@ -56,17 +56,18 @@ def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
             else:
                 prologue = 'scp '+temp_file+' {remote}:{rootdir}/{workdir}/'
                 epilogue = 'scp {remote}:{rootdir}/{workdir}/'+outfile+" "\
-                           +temp_dir+" && ssh rm -f {remote}:{rootdir}/"
+                           +temp_dir+" && ssh rm -f {remote}:{rootdir}/" \
                            +"{workdir}/"+outfile
             job.prologue = prologue
             job.epilogue = epilogue
             job.submit(block=True)
             with open(os.path.join(temp_dir, outfile), 'rb') as in_fh:
                 return pickle.load(in_fh)
-            os.unlink(os.path.join(temp_dir, outfile)
+            os.unlink(os.path.join(temp_dir, outfile))
         finally:
             os.unlink(temp_file)
             os.rmdir(temp_dir)
+    return clusterjob_map
 
 
 
@@ -78,20 +79,16 @@ def make_apply_compile():
 
 @click.command()
 @click.help_option('-h', '--help')
-@click.option('--compile-kwargs', type=click.File('rb'),
-              help='Pickled dump of the kwargs dictionary for compilation')
 @click.option('--debug', is_flag=True, default=False,
               help="Activate debug logging")
 @click.argument('prop_kwargs_list', type=click.File('rb'))
 @click.argument('outfile', type=click.File('wb'))
-def qnet_qsd_mpi_wrapper(compile_kwargs, debug, prop_kwargs_list, outfile):
+def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
 
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger()
     if debug:
         logger.setLevel(logging.DEBUG)
-
-    if compile_kwargs is not None:
 
     list_of_kwargs = pickle.load(prop_kwargs_list)
 
