@@ -1,20 +1,77 @@
 #!/usr/bin/env python
-import click
+import os
 import pickle
-from qnet.misc.qsd_codegen import qsd_run_worker
-from mpi4py import MPI
 import math
-import clusterjob
+from textwrap import dedent
+from tempfile import mkdtemp
 import logging
 
-TEMPLATE = r'''
+import click
+from mpi4py import MPI
+from qnet.misc.qsd_codegen import qsd_run_worker, compilation_worker
+import clusterjob
+
+BODY_PROPAGATE = r'''
 cd $CLUSTERJOB_WORKDIR
 source activate qnet
-aprun -n 160 qnet_qsd_mpi_wrapper --debug list_of_kwargs.dump
+aprun -B qnet_qsd_mpi_wrapper --debug qnet_qsd_kwargs.dump {outfile}
 '''
 
-def make_clusterjob_map(inifile, template, compile):
-    pass
+BODY_INI = r'''
+[Attributes]
+remote = copper
+rootdir = $WORKDIR
+workdir = qsd
+shell = /bin/bash
+ssh = /usr/local/ossh/bin/ssh
+scp = /usr/local/ossh/bin/scp
+
+[Resources]
+queue = standard
+-A = XXXXXXXXXXXXX
+-j = oe
+'''
+
+def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
+    """Create a map function suitable to be passed to
+    :meth:`qnet.misc.qsd_codegen.run_delayed`
+    """
+    def clusterjob_map(qsd_run_worker, list_of_kwargs)
+        job = clusterjob.JobScript(body, jobname='qnet_qsd')
+        job.read_settings(inifile)
+        job.resources['nodes'] = nodes
+        job.resources['ppn'] = ppn
+        job.resources['threads'] = 1
+        job.outfile = outfile
+        temp_dir = mkdtemp()
+        temp_file = os.path.join(temp_dir, 'qnet_qsd_kwargs.dump')
+        try:
+            with open(temp_file, 'wb') as out_fh:
+                pickle.dump(list_of_kwargs, out_fh)
+            if job.remote is None:
+                prologue = 'cp '+temp_file+' {rootdir}/{workdir}/'
+                epilogue = 'mv {rootdir}/{workdir}/'+outfile+" "+temp_dir
+            else:
+                prologue = 'scp '+temp_file+' {remote}:{rootdir}/{workdir}/'
+                epilogue = 'scp {remote}:{rootdir}/{workdir}/'+outfile+" "\
+                           +temp_dir+" && ssh rm -f {remote}:{rootdir}/"
+                           +"{workdir}/"+outfile
+            job.prologue = prologue
+            job.epilogue = epilogue
+            job.submit(block=True)
+            with open(os.path.join(temp_dir, outfile), 'rb') as in_fh:
+                return pickle.load(in_fh)
+            os.unlink(os.path.join(temp_dir, outfile)
+        finally:
+            os.unlink(temp_file)
+            os.rmdir(temp_dir)
+
+
+
+def make_apply_compile():
+    def remote_apply(compilation_worker, kwargs):
+        #prop_kwargs = pickle.load(compile_kwargs)
+        compilation_worker(kwargs)
 
 
 @click.command()
@@ -24,14 +81,14 @@ def make_clusterjob_map(inifile, template, compile):
 @click.option('--debug', is_flag=True, default=False,
               help="Activate debug logging")
 @click.argument('prop_kwargs_list', type=click.File('rb'))
-def qnet_qsd_mpi_wrapper(compile_kwargs, debug, prop_kwargs_list):
+@click.argument('outfile', type=click.File('wb'))
+def qnet_qsd_mpi_wrapper(compile_kwargs, debug, prop_kwargs_list, outfile):
 
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger()
     if debug:
         logger.setLevel(logging.DEBUG)
 
-    # TODO: call compilation worker
     if compile_kwargs is not None:
 
     list_of_kwargs = pickle.load(prop_kwargs_list)
@@ -99,7 +156,7 @@ def qnet_qsd_mpi_wrapper(compile_kwargs, debug, prop_kwargs_list):
             comm.send(combined_traj, dest=dest, tag=k)
 
     if i_proc == 0:
-        combined_traj.write('mpi_combined_traj.dat')
+        pickle.dump(list_of_kwargs, outfile)
 
 if __name__ == "__main__":
     qnet_qsd_mpi_wrapper()
