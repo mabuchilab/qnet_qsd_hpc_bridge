@@ -11,6 +11,8 @@ from mpi4py import MPI
 from qnet.misc.qsd_codegen import qsd_run_worker, compilation_worker
 import clusterjob
 
+__version__ = '0.0.1-pre'
+
 BODY_PROPAGATE = r'''
 cd $CLUSTERJOB_WORKDIR
 source activate qnet
