@@ -2,13 +2,11 @@
 import os
 import pickle
 import math
-from textwrap import dedent
 from tempfile import mkdtemp
 import logging
 
 import click
-from mpi4py import MPI
-from qnet.misc.qsd_codegen import qsd_run_worker, compilation_worker
+from qnet.misc.qsd_codegen import qsd_run_worker
 import clusterjob
 
 __version__ = '0.0.1-pre'
@@ -21,15 +19,14 @@ aprun -B qnet_qsd_mpi_wrapper --debug qnet_qsd_kwargs.dump {outfile}
 
 BODY_INI = r'''
 [Attributes]
-remote = copper
-rootdir = $WORKDIR
+backend = pbspro
+rootdir = /work/goerz
 workdir = qsd
 shell = /bin/bash
-ssh = /usr/local/ossh/bin/ssh
-scp = /usr/local/ossh/bin/scp
 
 [Resources]
-queue = standard
+time = 00:55:00
+queue = debug
 -A = XXXXXXXXXXXXX
 -j = oe
 '''
@@ -38,6 +35,7 @@ def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
     """Create a map function suitable to be passed to
     :meth:`qnet.misc.qsd_codegen.run_delayed`
     """
+    logger = logging.getLogger(__name__)
     def clusterjob_map(qsd_run_worker, list_of_kwargs):
         job = clusterjob.JobScript(body, jobname='qnet_qsd')
         job.read_settings(inifile)
@@ -62,19 +60,19 @@ def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
             job.epilogue = epilogue
             job.submit(block=True)
             with open(os.path.join(temp_dir, outfile), 'rb') as in_fh:
-                return pickle.load(in_fh)
+                result = pickle.load(in_fh)
             os.unlink(os.path.join(temp_dir, outfile))
+            return result
         finally:
-            os.unlink(temp_file)
-            os.rmdir(temp_dir)
+            try:
+                os.unlink(temp_file)
+            except OSError as exc_info:
+                logger.warn(str(exc_info))
+            try:
+                os.rmdir(temp_dir)
+            except OSError as exc_info:
+                logger.warn(str(exc_info))
     return clusterjob_map
-
-
-
-def make_apply_compile():
-    def remote_apply(compilation_worker, kwargs):
-        #prop_kwargs = pickle.load(compile_kwargs)
-        compilation_worker(kwargs)
 
 
 @click.command()
@@ -84,6 +82,18 @@ def make_apply_compile():
 @click.argument('prop_kwargs_list', type=click.File('rb'))
 @click.argument('outfile', type=click.File('wb'))
 def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
+    """Load pickled list of kwargs from PROP_KWARGS_LIST (cf.
+    qnet.misc.qsd_codegen.QSDCodeGen.run_delayed). For each kwargs dict,
+    propagate a trajectory with the parameters given therein, distributing
+    the different trajectories over all available MPI processes. Average over
+    all trajectories and write pickled list containing one TrajectoryData
+    instance (the total average data) to OUTFILE.
+
+    In order to avoid an MPI deadlock, any errors encountered during the
+    propagation are handled internally. If errors occur, only a subset of all
+    trajectories may be included in the averaged result, or an empty list may
+    be dumped to OUTFILE. Any errors will be logged to stdout.
+    """
 
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger()
@@ -92,27 +102,39 @@ def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
 
     list_of_kwargs = pickle.load(prop_kwargs_list)
 
+    from mpi4py import MPI
     comm = MPI.COMM_WORLD
 
     n_procs = comm.Get_size() # number of MPI processes
 
     # split jobs into batches
+    if comm.Get_rank() == 0 and len(list_of_kwargs) < n_procs:
+        logger.warn("There are less tasks than MPI processors. You are "
+                    "wasting resources.")
     batches = clusterjob.utils.split_seq(list_of_kwargs, n_procs)
 
     # each MPI process handles one batch
     i_proc = comm.Get_rank() # the index of the current MPI proc
-    logger.debug("This is MPI process %d/%d, processing batch of %d tasks",
+    logger.debug("This is MPI process %3d/%3d, processing batch of %3d tasks",
                  i_proc+1, n_procs, len(batches[i_proc]))
-    trajs = [qsd_run_worker(kwargs) for kwargs in batches[i_proc]]
-    logger.debug("process %d, finished local propagations", i_proc)
-    # we average all of the trajectories in the batch locally
-    combined_traj = trajs[0]
     try:
-        combined_traj.extend(*trajs[1:])
-    except ValueError as exc_info:
-        logger.error("process %d, local avg: %s", i_proc, str(exc_info))
-    logger.debug("process %d, locally averaged %d trajectories",
-                 i_proc, len(combined_traj.record))
+        trajs = [qsd_run_worker(kwargs) for kwargs in batches[i_proc]]
+    except Exception as exc_info:
+        logger.error("ERROR calling qsd_run_worker: %s", str(exc_info))
+        trajs = []
+    logger.debug("process %3d, finished local propagations", i_proc)
+    if len(trajs) > 0:
+        # we average all of the trajectories in the batch locally
+        combined_traj = trajs[0]
+        try:
+            combined_traj.extend(*trajs[1:])
+        except ValueError as exc_info:
+            logger.error("process %3d, local avg: %s", i_proc, str(exc_info))
+        logger.debug("process %3d, locally averaged %3d trajectories",
+                    i_proc, len(combined_traj.record))
+    else:
+        logger.error("process %3d: no trajectories", i_proc)
+        combined_traj = None
 
     # run through a binary tree communication protocol to average the data
     # from all MPI processes into proccess ID 0. The procedure looks as
@@ -130,32 +152,50 @@ def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
         # update communication status
         if communication_status == 'send':
             communication_status = 'inactive'
-            logger.debug("process %d, round %d: set to %s",
+            logger.debug("process %3d, round %2d: set to %s",
                          i_proc, k, communication_status)
         if communication_status == 'receive':
             if (i_proc//2**k) % 2 == 1:
                 communication_status = 'send'
-                logger.debug("process %d, round %d: set to %s",
+                logger.debug("process %3d, round %2d: set to %s",
                              i_proc, k, communication_status)
         # send or receive
         if communication_status == 'receive':
             source = i_proc + 2**k
             if source < n_procs: # there is a process with i_proc == source
-                logger.debug("process %d, round %d: receive from process %d",
+                logger.debug("process %3d, round %2d: receive from process %3d",
                              i_proc, k, source)
                 try:
-                    combined_traj.extend(comm.recv(source=source, tag=k))
+                    received_traj = comm.recv(source=source, tag=k)
+                    if received_traj is None:
+                        logger.debug("process %3d, round %2d: received None "
+                                     "from process %3d", i_proc, k, source)
+                    else:
+                        if combined_traj is None:
+                            combined_traj = received_traj
+                        else:
+                            combined_traj.extend(received_traj)
                 except ValueError as exc_info:
-                    logger.error("process %d, round %d: %s",
+                    logger.error("process %3d, round %2d: %s",
                                  i_proc, k, str(exc_info))
         elif communication_status == 'send':
             dest = i_proc - 2**k
-            logger.debug("process %d, round %d: send %d records to process %d",
-                         i_proc, k, len(combined_traj.record), dest)
+            if combined_traj is None:
+                logger.debug("process %3d, round %2d: send None to process %3d",
+                            i_proc, k, dest)
+            else:
+                logger.debug("process %3d, round %2d: send %3d records to "
+                             "process %3d", i_proc, k,
+                             len(combined_traj.record), dest)
             comm.send(combined_traj, dest=dest, tag=k)
 
     if i_proc == 0:
-        pickle.dump(list_of_kwargs, outfile)
+        result = []
+        if combined_traj is not None:
+            result = [combined_traj, ]
+        else:
+            logger.error("No trajectory data")
+        pickle.dump(result, outfile)
 
 if __name__ == "__main__":
     qnet_qsd_mpi_wrapper()
