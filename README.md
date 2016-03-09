@@ -7,7 +7,7 @@ calculation of quantum trajectories.
 ## Prerequisites and Installation ##
 
 The following instructions target a Cray XE Cluster (specifically
-[copper.ors.hpc.mil][Copper]. After logging in to the cluster, go through the
+[copper.ors.hpc.mil][Copper]). After logging in to the cluster, go through the
 following steps:
 
 *   Install the [Anaconda Python Distribution][Anaconda] in your home directory
