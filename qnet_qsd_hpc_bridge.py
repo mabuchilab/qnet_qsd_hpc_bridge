@@ -34,6 +34,16 @@ queue = debug
 def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
     """Create a map function suitable to be passed to
     :meth:`qnet.misc.qsd_codegen.run_delayed`
+
+    Arguments:
+        body (str): clusterjob body template as multiline string
+        inifile (str): name of file from which to read job properties (see
+            :meth:`clusterjob.JobScript.read_settings`)
+        outfile (str): filename of (temporary) output file, to be passed to
+            `qnet_qsd_mpi_wrapper`
+        nodes (int): The number of compute nodes to use
+        ppn (int): The number of MPI processes per node. The total number of
+            MPI processes will be ``nodes*ppn``
     """
     logger = logging.getLogger(__name__)
     def clusterjob_map(qsd_run_worker, list_of_kwargs):
@@ -79,15 +89,18 @@ def make_clusterjob_map(body, inifile, outfile, nodes, ppn):
 @click.help_option('-h', '--help')
 @click.option('--debug', is_flag=True, default=False,
               help="Activate debug logging")
+@click.option('--get-all-trajs', is_flag=True, default=False,
+              help="Return a list of all trajectories")
 @click.argument('prop_kwargs_list', type=click.File('rb'))
 @click.argument('outfile', type=click.File('wb'))
-def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
+def qnet_qsd_mpi_wrapper(debug, get_all_trajs, prop_kwargs_list, outfile):
     """Load pickled list of kwargs from PROP_KWARGS_LIST (cf.
     qnet.misc.qsd_codegen.QSDCodeGen.run_delayed). For each kwargs dict,
     propagate a trajectory with the parameters given therein, distributing
-    the different trajectories over all available MPI processes. Average over
-    all trajectories and write pickled list containing one TrajectoryData
-    instance (the total average data) to OUTFILE.
+    the different trajectories over all available MPI processes. If
+    --get-all-trajs is given, write the pickled list of all trajectories to
+    OUTFILE. Otherwise, average over all trajectories and write pickled list
+    containing one TrajectoryData instance (the total average data) to OUTFILE.
 
     In order to avoid an MPI deadlock, any errors encountered during the
     propagation are handled internally. If errors occur, only a subset of all
@@ -123,20 +136,21 @@ def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
         logger.error("ERROR calling qsd_run_worker: %s", str(exc_info))
         trajs = []
     logger.debug("process %3d, finished local propagations", i_proc)
-    if len(trajs) > 0:
-        # we average all of the trajectories in the batch locally
-        combined_traj = trajs[0]
-        try:
-            combined_traj.extend(*trajs[1:])
-        except ValueError as exc_info:
-            logger.error("process %3d, local avg: %s", i_proc, str(exc_info))
-        logger.debug("process %3d, locally averaged %3d trajectories",
-                    i_proc, len(combined_traj.record))
-    else:
-        logger.error("process %3d: no trajectories", i_proc)
-        combined_traj = None
+    if not get_all_trajs:
+        if len(trajs) > 0:
+            # we average all of the trajectories in the batch locally
+            combined_traj = trajs[0]
+            try:
+                combined_traj.extend(*trajs[1:])
+            except ValueError as exc_info:
+                logger.error("process %3d, local avg: %s", i_proc, str(exc_info))
+            logger.debug("process %3d, locally averaged %3d trajectories",
+                        i_proc, len(combined_traj.record))
+        else:
+            logger.error("process %3d: no trajectories", i_proc)
+            combined_traj = None
 
-    # run through a binary tree communication protocol to average the data
+    # run through a binary tree communication protocol to average or collect the data
     # from all MPI processes into proccess ID 0. The procedure looks as
     # follows:
     #
@@ -167,34 +181,48 @@ def qnet_qsd_mpi_wrapper(debug, prop_kwargs_list, outfile):
                              i_proc, k, source)
                 try:
                     received_traj = comm.recv(source=source, tag=k)
+                    # received_traj can be instance, or list
                     if received_traj is None:
                         logger.debug("process %3d, round %2d: received None "
                                      "from process %3d", i_proc, k, source)
                     else:
-                        if combined_traj is None:
-                            combined_traj = received_traj
+                        if get_all_trajs:
+                            # received_traj is list
+                            trajs.extend(received_traj)
                         else:
-                            combined_traj.extend(received_traj)
+                            # received_traj is instance
+                            if combined_traj is None:
+                                combined_traj = received_traj
+                            else:
+                                combined_traj.extend(received_traj)
                 except ValueError as exc_info:
                     logger.error("process %3d, round %2d: %s",
                                  i_proc, k, str(exc_info))
         elif communication_status == 'send':
             dest = i_proc - 2**k
-            if combined_traj is None:
-                logger.debug("process %3d, round %2d: send None to process %3d",
-                            i_proc, k, dest)
+            if get_all_trajs:
+                logger.debug("process %3d, round %2d: send %d trajs to process %3d",
+                            i_proc, k, len(trajs), dest)
+                comm.send(trajs, dest=dest, tag=k)
             else:
-                logger.debug("process %3d, round %2d: send %3d records to "
-                             "process %3d", i_proc, k,
-                             len(combined_traj.record), dest)
-            comm.send(combined_traj, dest=dest, tag=k)
+                if combined_traj is None:
+                    logger.debug("process %3d, round %2d: send None to process %3d",
+                                i_proc, k, dest)
+                else:
+                    logger.debug("process %3d, round %2d: send %3d records to "
+                                "process %3d", i_proc, k,
+                                len(combined_traj.record), dest)
+                comm.send(combined_traj, dest=dest, tag=k)
 
     if i_proc == 0:
         result = []
-        if combined_traj is not None:
-            result = [combined_traj, ]
+        if get_all_trajs:
+            result = trajs
         else:
-            logger.error("No trajectory data")
+            if combined_traj is not None:
+                result = [combined_traj, ]
+            else:
+                logger.error("No trajectory data")
         pickle.dump(result, outfile)
 
 if __name__ == "__main__":

@@ -107,6 +107,10 @@ Then, add e.g. the following code to the script or IPython session:
     ...     outfile='traj.out', nodes=5, ppn=32)
     >>> codegen.run_delayed(map=copper_map)
 
+Note that we can obtain obtain the list of all newly generated trajectories from
+the call to `run_delayed` by calling `qnet_qsd_mpi_wrapper` with the
+`--get-all-trajs` in the script body.
+
 [Copper]: http://www.ors.hpc.mil/docs/copperUserGuide.html
 [Anaconda]: https://www.continuum.io/downloads
 [QNET]: https://github.com/mabuchilab/QNET
